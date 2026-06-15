@@ -2,7 +2,7 @@
 // @name              教师研修网自动看课脚本
 // @name:zh-CN        教师研修网自动看课脚本
 // @namespace         https://github.com/AGkite/yanxiu
-// @version           2.4.0
+// @version           2.5.0
 // @description       Auto study on yanxiu.com: course pick, speed play, quiz, next lesson.
 // @description:zh-CN yanxiu.com 自动选课、倍速播放、自动答题、自动切下一节
 // @author            AGkite
@@ -24,11 +24,13 @@
     const LOG = '[研修网刷课]';
     // 倍速设置：建议 1~2，过高可能导致学时不记录或被检测
     const PLAYBACK_RATE = 2;
-    // 心跳超过此时间未更新，视为视频页已关闭（视频页每 3 秒刷新一次）
-    const PLAYER_HEARTBEAT_STALE = 20 * 1000;
+    // 学习锁：视频页存活期间保持，仅课程结束或超时后释放（不依赖心跳，避免后台 tab 被节流误判）
+    const STORAGE_PLAYER_LOCK = 'yx-player-lock';
     const STORAGE_PLAYER_HEARTBEAT = 'yx-player-heartbeat';
     const STORAGE_PLAYER_TAB = 'yx-player-tab-id';
     const STORAGE_PLAYER_URL = 'yx-player-url';
+    // 心跳超过 15 分钟无更新，视为视频页崩溃，允许列表页重新打开
+    const LOCK_CRASH_TIMEOUT = 15 * 60 * 1000;
     const TAB_ID = sessionStorage.getItem('yx-tab-id') || ('tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     sessionStorage.setItem('yx-tab-id', TAB_ID);
     let statusText = '脚本已加载';
@@ -74,8 +76,27 @@
         return Date.now() - parseInt(beat, 10);
     }
 
+    function setPlayerLock() {
+        localStorage.setItem(STORAGE_PLAYER_LOCK, '1');
+        localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(Date.now()));
+    }
+
+    function releasePlayerLock() {
+        localStorage.removeItem(STORAGE_PLAYER_LOCK);
+        localStorage.removeItem(STORAGE_PLAYER_HEARTBEAT);
+        localStorage.removeItem(STORAGE_PLAYER_TAB);
+        localStorage.removeItem(STORAGE_PLAYER_URL);
+    }
+
     function isPlayerTabOpen() {
-        return getHeartbeatAge() < PLAYER_HEARTBEAT_STALE;
+        if (localStorage.getItem(STORAGE_PLAYER_LOCK) !== '1') {
+            return false;
+        }
+        if (getHeartbeatAge() > LOCK_CRASH_TIMEOUT) {
+            releasePlayerLock();
+            return false;
+        }
+        return true;
     }
 
     function touchPlayerHeartbeat() {
@@ -83,6 +104,7 @@
         if (pageType !== 'legacy-player' && pageType !== 'train2-player') {
             return;
         }
+        localStorage.setItem(STORAGE_PLAYER_LOCK, '1');
         localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(Date.now()));
         localStorage.setItem(STORAGE_PLAYER_TAB, TAB_ID);
         localStorage.setItem(STORAGE_PLAYER_URL, location.href.split('#')[0]);
@@ -90,31 +112,14 @@
 
     function clearPlayerTabOpen() {
         if (localStorage.getItem(STORAGE_PLAYER_TAB) === TAB_ID) {
-            localStorage.removeItem(STORAGE_PLAYER_HEARTBEAT);
-            localStorage.removeItem(STORAGE_PLAYER_TAB);
-            localStorage.removeItem(STORAGE_PLAYER_URL);
+            releasePlayerLock();
         }
     }
 
-    // 关闭重复打开的同课程视频标签页
-    function closeDuplicatePlayerTab() {
+    function forceReleaseIfPlayerPage() {
         const pageType = getPageType();
-        if (pageType !== 'legacy-player' && pageType !== 'train2-player') {
-            return;
-        }
-        const ownerTab = localStorage.getItem(STORAGE_PLAYER_TAB);
-        const ownerUrl = localStorage.getItem(STORAGE_PLAYER_URL);
-        const currentUrl = location.href.split('#')[0];
-        if (
-            ownerTab &&
-            ownerTab !== TAB_ID &&
-            ownerUrl === currentUrl &&
-            isPlayerTabOpen()
-        ) {
-            log('检测到重复视频页，关闭本标签');
-            setTimeout(() => {
-                window.close();
-            }, 1500);
+        if (pageType === 'legacy-player' || pageType === 'train2-player') {
+            releasePlayerLock();
         }
     }
 
@@ -363,7 +368,7 @@
         listClickLocked = true;
         if (clickElement(lesson.button)) {
             lastListClickAt = now;
-            localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(now));
+            setPlayerLock();
             localStorage.setItem(STORAGE_PLAYER_TAB, 'list-pending');
             log(`已点击继续看课（进度 ${lesson.percent}%）`);
         }
@@ -373,7 +378,6 @@
     }
 
     function handleVideoPlayer() {
-        closeDuplicatePlayerTab();
         touchPlayerHeartbeat();
         let anyEnded = false;
 
@@ -438,14 +442,14 @@
             if (!tryGoNextVideo()) {
                 if (location.pathname.includes('/train2/')) {
                     log('本节已学完，返回课程列表');
-                    clearPlayerTabOpen();
+                    forceReleaseIfPlayerPage();
                     const memberUrl = location.href.replace(/\/training\/[^/?#]+.*$/, '/training/member');
                     if (memberUrl !== location.href) {
                         setTimeout(() => { location.href = memberUrl; }, 2000);
                     }
                 } else {
                     log('本节已学完，关闭页面返回列表');
-                    clearPlayerTabOpen();
+                    forceReleaseIfPlayerPage();
                     setTimeout(() => {
                         if (window.opener) {
                             window.close();
@@ -521,7 +525,7 @@
             const link = courses[i].firstChild.firstChild;
             if (link) {
                 clickElement(link);
-                localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(Date.now()));
+                setPlayerLock();
                 localStorage.setItem(STORAGE_PLAYER_TAB, 'list-pending');
                 log(`已打开第 ${i + 1} 个课程`);
             }
@@ -542,6 +546,12 @@
         } else if (pageType === 'legacy-list') {
             handleLegacyCourseList();
         } else if (pageType === 'train2-player' || pageType === 'legacy-player') {
+            touchPlayerHeartbeat();
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) {
+                    touchPlayerHeartbeat();
+                }
+            });
             handleVideoPlayer();
             setInterval(handleVideoPlayer, 3000);
             setInterval(handleQuiz, 5000);
