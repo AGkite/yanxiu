@@ -2,9 +2,9 @@
 // @name              教师研修网自动看课脚本
 // @name:zh-CN        教师研修网自动看课脚本
 // @namespace         https://github.com/AGkite/yanxiu
-// @version           2.7.0
-// @description       Auto study on yanxiu.com: course pick, speed play, quiz, PPT/doc, next lesson.
-// @description:zh-CN yanxiu.com 自动选课、倍速播放、PPT课件翻页、自动答题、自动切下一节
+// @version           2.8.0
+// @description       Auto study on yanxiu.com: skip PPT, speed play, quiz, next video lesson.
+// @description:zh-CN yanxiu.com 跳过PPT课件、自动学习视频、倍速播放、自动答题、自动切下一节
 // @author            AGkite
 // @match             https://*.yanxiu.com/*
 // @icon              https://www.google.com/s2/favicons?sz=64&domain=yanxiu.com
@@ -31,17 +31,15 @@
     const STORAGE_PLAYER_URL = 'yx-player-url';
     // 心跳超过此时间未更新，视为视频页已关闭（后台 tab 约每 15~60 秒刷新一次）
     const HEARTBEAT_ACTIVE = 2 * 60 * 1000;
-    // PPT/文档每页停留秒数（会随 PLAYBACK_RATE 缩短）
-    const DOC_PAGE_SECONDS = 6;
-    const DOC_CATALOG_SECONDS = 40;
+    // true = 跳过 PPT/课件，只学习视频
+    const SKIP_PPT = true;
+    const SECTION_HEADERS = ['课程导学', '主题解析', '延伸阅读'];
     const TAB_ID = sessionStorage.getItem('yx-tab-id') || ('tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     sessionStorage.setItem('yx-tab-id', TAB_ID);
     let statusText = '脚本已加载';
     let lastListClickAt = 0;
     let lastNextClickAt = 0;
-    let lastDocPageAt = 0;
-    let lastDocPageKey = '';
-    let lastCatalogAdvanceAt = 0;
+    let lastSkipAt = 0;
     let listClickLocked = false;
 
     function log(msg) {
@@ -233,6 +231,142 @@
         return false;
     }
 
+    function isCatalogItemCourseware(item) {
+        if (!item) {
+            return false;
+        }
+        const badges = item.querySelectorAll('span, em, label, i, div');
+        for (const badge of badges) {
+            if (badge.textContent.trim() === '课件' && isVisible(badge)) {
+                return true;
+            }
+        }
+        return item.textContent.includes('课件');
+    }
+
+    function isSectionHeader(item) {
+        const text = item.textContent.trim();
+        return SECTION_HEADERS.includes(text) ||
+            (text.length < 8 && !item.querySelector('a, button'));
+    }
+
+    function getCatalogItems() {
+        const selectors = [
+            '.catalogue-list li',
+            '.catalog-list li',
+            '.menu-list li',
+            '[class*="catalog"] li',
+            '[class*="Catalog"] li',
+            '.ivu-tree-title'
+        ];
+        for (const sel of selectors) {
+            const found = [...document.querySelectorAll(sel)].filter(isVisible);
+            if (found.length > 1) {
+                return found;
+            }
+        }
+        return [];
+    }
+
+    function findActiveCatalogIndex(items) {
+        let activeIndex = -1;
+        items.forEach((item, index) => {
+            const cls = item.className || '';
+            const style = window.getComputedStyle(item);
+            if (
+                cls.includes('active') ||
+                cls.includes('current') ||
+                cls.includes('selected') ||
+                item.querySelector('.active, .current, .selected') ||
+                style.color === 'rgb(24, 144, 255)' ||
+                style.fontWeight === '600' ||
+                style.fontWeight === '700'
+            ) {
+                activeIndex = index;
+            }
+        });
+        return activeIndex;
+    }
+
+    function isCoursewarePage() {
+        if (hasActiveVideo()) {
+            return false;
+        }
+        if (getDocumentPageInfo()) {
+            return true;
+        }
+        const items = getCatalogItems();
+        const activeIndex = findActiveCatalogIndex(items);
+        if (activeIndex >= 0 && isCatalogItemCourseware(items[activeIndex])) {
+            return true;
+        }
+        return !hasActiveVideo() && findByExactText('课件').some((el) => isVisible(el));
+    }
+
+    function clickCatalogItem(items, index) {
+        const item = items[index];
+        if (!item || isSectionHeader(item)) {
+            return false;
+        }
+        const target = item.querySelector('a, span, div, p') || item;
+        if (clickElement(target)) {
+            log(`已切换目录第 ${index + 1} 节`);
+            return true;
+        }
+        return false;
+    }
+
+    function clickNextVideoCatalogItem() {
+        const items = getCatalogItems();
+        if (items.length === 0) {
+            return false;
+        }
+        const activeIndex = findActiveCatalogIndex(items);
+        const start = activeIndex >= 0 ? activeIndex + 1 : 0;
+        for (let i = start; i < items.length; i++) {
+            if (isSectionHeader(items[i]) || isCatalogItemCourseware(items[i])) {
+                continue;
+            }
+            if (clickCatalogItem(items, i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function clickFirstVideoCatalogItem() {
+        const items = getCatalogItems();
+        for (let i = 0; i < items.length; i++) {
+            if (isSectionHeader(items[i]) || isCatalogItemCourseware(items[i])) {
+                continue;
+            }
+            if (clickCatalogItem(items, i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function handleSkipCourseware() {
+        const now = Date.now();
+        if (now - lastSkipAt < 2000) {
+            return;
+        }
+
+        if (clickNextVideoCatalogItem()) {
+            lastSkipAt = now;
+            log('已跳过课件，切换下一视频');
+            return;
+        }
+
+        log('本课程无视频内容，返回列表');
+        lastSkipAt = now;
+        if (now - lastNextClickAt >= 3000) {
+            lastNextClickAt = now;
+            finishCurrentCourse();
+        }
+    }
+
     function getDocumentPageInfo() {
         const candidates = [...document.querySelectorAll('span, div, p, em, b')].filter(isVisible);
         for (const el of candidates) {
@@ -247,54 +381,6 @@
             }
         }
         return null;
-    }
-
-    function clickDocumentNextPage() {
-        const textBtns = ['下一页', '下一张', '下一章'];
-        for (const text of textBtns) {
-            const btn = findByExactText(text).find((el) => !el.closest('.ended-mask, .catalogue-list, .catalog-list'));
-            if (btn && clickElement(btn)) {
-                return true;
-            }
-        }
-
-        const iconSelectors = [
-            '.ivu-icon-ios-arrow-forward',
-            '.ivu-icon-arrow-right-b',
-            '[class*="arrow-forward"]',
-            '[class*="arrow-right"]',
-            '[class*="icon-next"]',
-            '[class*="page-next"]',
-            '[class*="PageNext"]'
-        ];
-        for (const sel of iconSelectors) {
-            const icons = [...document.querySelectorAll(sel)].filter(isVisible);
-            for (const icon of icons) {
-                const target = icon.closest('button, a, span, div') || icon;
-                if (clickElement(target)) {
-                    return true;
-                }
-            }
-        }
-
-        const pageInfo = getDocumentPageInfo();
-        if (pageInfo && pageInfo.el.parentElement) {
-            const siblings = [...pageInfo.el.parentElement.children].filter(isVisible);
-            const idx = siblings.indexOf(pageInfo.el);
-            if (idx >= 0) {
-                for (let i = idx + 1; i < siblings.length; i++) {
-                    const target = siblings[i].querySelector('i, button, span, a') || siblings[i];
-                    if (clickElement(target)) {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        document.documentElement.dispatchEvent(new KeyboardEvent('keydown', {
-            key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true
-        }));
-        return true;
     }
 
     function finishCurrentCourse() {
@@ -316,53 +402,6 @@
                 history.back();
             }
         }, 2000);
-    }
-
-    function handleDocumentPlayer() {
-        const pageInfo = getDocumentPageInfo();
-        const pageInterval = Math.max(3000, (DOC_PAGE_SECONDS * 1000) / PLAYBACK_RATE);
-        const catalogInterval = Math.max(15000, (DOC_CATALOG_SECONDS * 1000) / PLAYBACK_RATE);
-        const now = Date.now();
-
-        if (pageInfo) {
-            const pageKey = pageInfo.current + '/' + pageInfo.total;
-            if (pageInfo.current < pageInfo.total) {
-                if (lastDocPageKey !== pageKey) {
-                    lastDocPageKey = pageKey;
-                    lastDocPageAt = now;
-                    log(`PPT 阅读中 ${pageInfo.current}/${pageInfo.total}`);
-                    return;
-                }
-                if (now - lastDocPageAt >= pageInterval) {
-                    clickDocumentNextPage();
-                    lastDocPageAt = now;
-                    log(`PPT 翻页 ${pageInfo.current}/${pageInfo.total}`);
-                }
-                return;
-            }
-
-            log(`PPT 已到最后一页 ${pageInfo.current}/${pageInfo.total}`);
-            if (now - lastNextClickAt >= 5000) {
-                if (!tryGoNextVideo()) {
-                    finishCurrentCourse();
-                }
-            }
-            return;
-        }
-
-        if (now - lastCatalogAdvanceAt >= catalogInterval) {
-            if (clickNextCatalogItem()) {
-                lastCatalogAdvanceAt = now;
-                lastDocPageKey = '';
-                return;
-            }
-            if (now - lastNextClickAt >= 5000 && tryGoNextVideo()) {
-                lastCatalogAdvanceAt = now;
-                return;
-            }
-        }
-
-        log('课件学习中…');
     }
 
     function applyPlaybackRate(video) {
@@ -415,55 +454,6 @@
         return false;
     }
 
-    function clickNextCatalogItem() {
-        const selectors = [
-            '.catalogue-list li',
-            '.catalog-list li',
-            '.menu-list li',
-            '[class*="catalog"] li',
-            '[class*="Catalog"] li',
-            '.ivu-tree-title'
-        ];
-        let items = [];
-        for (const sel of selectors) {
-            const found = [...document.querySelectorAll(sel)].filter(isVisible);
-            if (found.length > 1) {
-                items = found;
-                break;
-            }
-        }
-        if (items.length === 0) {
-            return false;
-        }
-
-        let activeIndex = -1;
-        items.forEach((item, index) => {
-            const cls = item.className || '';
-            const style = window.getComputedStyle(item);
-            if (
-                cls.includes('active') ||
-                cls.includes('current') ||
-                cls.includes('selected') ||
-                item.querySelector('.active, .current, .selected') ||
-                style.color === 'rgb(24, 144, 255)' ||
-                style.fontWeight === '600' ||
-                style.fontWeight === '700'
-            ) {
-                activeIndex = index;
-            }
-        });
-
-        const start = activeIndex >= 0 ? activeIndex + 1 : 0;
-        for (let i = start; i < items.length; i++) {
-            const target = items[i].querySelector('a, span, div, p') || items[i];
-            if (clickElement(target)) {
-                log(`已切换目录第 ${i + 1} 节`);
-                return true;
-            }
-        }
-        return false;
-    }
-
     function tryGoNextVideo() {
         const now = Date.now();
         if (now - lastNextClickAt < 5000) {
@@ -484,7 +474,7 @@
             return true;
         }
 
-        if (clickNextCatalogItem()) {
+        if (clickNextVideoCatalogItem()) {
             lastNextClickAt = now;
             return true;
         }
@@ -609,7 +599,9 @@
         }
 
         if (!hasActiveVideo()) {
-            handleDocumentPlayer();
+            if (SKIP_PPT) {
+                handleSkipCourseware();
+            }
             return;
         }
 
@@ -740,6 +732,13 @@
             handleVideoPlayer();
             setInterval(handleVideoPlayer, 3000);
             setInterval(handleQuiz, 5000);
+            if (SKIP_PPT) {
+                setTimeout(() => {
+                    if (isCoursewarePage()) {
+                        clickFirstVideoCatalogItem() || handleSkipCourseware();
+                    }
+                }, 2500);
+            }
         } else {
             cleanupStaleLock();
             setTimeout(() => {
