@@ -2,7 +2,7 @@
 // @name              教师研修网自动看课脚本
 // @name:zh-CN        教师研修网自动看课脚本
 // @namespace         https://github.com/AGkite/yanxiu
-// @version           2.5.0
+// @version           2.6.0
 // @description       Auto study on yanxiu.com: course pick, speed play, quiz, next lesson.
 // @description:zh-CN yanxiu.com 自动选课、倍速播放、自动答题、自动切下一节
 // @author            AGkite
@@ -29,8 +29,8 @@
     const STORAGE_PLAYER_HEARTBEAT = 'yx-player-heartbeat';
     const STORAGE_PLAYER_TAB = 'yx-player-tab-id';
     const STORAGE_PLAYER_URL = 'yx-player-url';
-    // 心跳超过 15 分钟无更新，视为视频页崩溃，允许列表页重新打开
-    const LOCK_CRASH_TIMEOUT = 15 * 60 * 1000;
+    // 心跳超过此时间未更新，视为视频页已关闭（后台 tab 约每 15~60 秒刷新一次）
+    const HEARTBEAT_ACTIVE = 2 * 60 * 1000;
     const TAB_ID = sessionStorage.getItem('yx-tab-id') || ('tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     sessionStorage.setItem('yx-tab-id', TAB_ID);
     let statusText = '脚本已加载';
@@ -92,11 +92,30 @@
         if (localStorage.getItem(STORAGE_PLAYER_LOCK) !== '1') {
             return false;
         }
-        if (getHeartbeatAge() > LOCK_CRASH_TIMEOUT) {
+        if (getHeartbeatAge() > HEARTBEAT_ACTIVE) {
             releasePlayerLock();
             return false;
         }
         return true;
+    }
+
+    // 列表页启动时清理残留锁（例如手动关闭了视频 tab）
+    function cleanupStaleLock() {
+        if (localStorage.getItem(STORAGE_PLAYER_LOCK) !== '1') {
+            return;
+        }
+        if (getHeartbeatAge() > HEARTBEAT_ACTIVE) {
+            releasePlayerLock();
+            log('视频页已关闭，准备继续下一课程');
+        }
+    }
+
+    function bindPlayerTabUnload() {
+        window.addEventListener('pagehide', () => {
+            if (localStorage.getItem(STORAGE_PLAYER_TAB) === TAB_ID) {
+                releasePlayerLock();
+            }
+        });
     }
 
     function touchPlayerHeartbeat() {
@@ -539,23 +558,29 @@
         log(`检测到页面类型: ${pageType}`);
 
         if (pageType === 'train2-list' || pageType === 'project-index') {
+            cleanupStaleLock();
             setTimeout(handleCourseList, 3000);
             setInterval(handleCourseList, 10000);
             setInterval(handleVideoPlayer, 3000);
             setInterval(handleQuiz, 5000);
         } else if (pageType === 'legacy-list') {
+            cleanupStaleLock();
             handleLegacyCourseList();
         } else if (pageType === 'train2-player' || pageType === 'legacy-player') {
+            bindPlayerTabUnload();
             touchPlayerHeartbeat();
             document.addEventListener('visibilitychange', () => {
-                if (!document.hidden) {
-                    touchPlayerHeartbeat();
-                }
+                touchPlayerHeartbeat();
             });
+            // 独立心跳，避免 handleVideoPlayer 在后台 tab 被节流后列表页误判
+            setInterval(() => {
+                touchPlayerHeartbeat();
+            }, 10000);
             handleVideoPlayer();
             setInterval(handleVideoPlayer, 3000);
             setInterval(handleQuiz, 5000);
         } else {
+            cleanupStaleLock();
             setTimeout(() => {
                 handleCourseList();
                 handleVideoPlayer();
