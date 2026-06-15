@@ -2,9 +2,9 @@
 // @name              教师研修网自动看课脚本
 // @name:zh-CN        教师研修网自动看课脚本
 // @namespace         https://github.com/AGkite/yanxiu
-// @version           2.6.0
-// @description       Auto study on yanxiu.com: course pick, speed play, quiz, next lesson.
-// @description:zh-CN yanxiu.com 自动选课、倍速播放、自动答题、自动切下一节
+// @version           2.7.0
+// @description       Auto study on yanxiu.com: course pick, speed play, quiz, PPT/doc, next lesson.
+// @description:zh-CN yanxiu.com 自动选课、倍速播放、PPT课件翻页、自动答题、自动切下一节
 // @author            AGkite
 // @match             https://*.yanxiu.com/*
 // @icon              https://www.google.com/s2/favicons?sz=64&domain=yanxiu.com
@@ -31,11 +31,17 @@
     const STORAGE_PLAYER_URL = 'yx-player-url';
     // 心跳超过此时间未更新，视为视频页已关闭（后台 tab 约每 15~60 秒刷新一次）
     const HEARTBEAT_ACTIVE = 2 * 60 * 1000;
+    // PPT/文档每页停留秒数（会随 PLAYBACK_RATE 缩短）
+    const DOC_PAGE_SECONDS = 6;
+    const DOC_CATALOG_SECONDS = 40;
     const TAB_ID = sessionStorage.getItem('yx-tab-id') || ('tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     sessionStorage.setItem('yx-tab-id', TAB_ID);
     let statusText = '脚本已加载';
     let lastListClickAt = 0;
     let lastNextClickAt = 0;
+    let lastDocPageAt = 0;
+    let lastDocPageKey = '';
+    let lastCatalogAdvanceAt = 0;
     let listClickLocked = false;
 
     function log(msg) {
@@ -197,7 +203,166 @@
             ].join(';');
             document.body.appendChild(panel);
         }
-        panel.textContent = `${LOG} ${statusText} | 倍速 ${PLAYBACK_RATE}x`;
+        panel.textContent = `${LOG} ${statusText}`;
+    }
+
+    function hasActiveVideo() {
+        for (const video of document.querySelectorAll('video')) {
+            if (!isVisible(video)) {
+                continue;
+            }
+            if (video.duration && !isNaN(video.duration) && video.duration > 0) {
+                return true;
+            }
+        }
+        for (const frame of document.querySelectorAll('iframe')) {
+            try {
+                const doc = frame.contentDocument;
+                if (!doc) {
+                    continue;
+                }
+                for (const video of doc.querySelectorAll('video')) {
+                    if (video.duration && !isNaN(video.duration) && video.duration > 0) {
+                        return true;
+                    }
+                }
+            } catch (e) {
+                // 跨域 iframe 忽略
+            }
+        }
+        return false;
+    }
+
+    function getDocumentPageInfo() {
+        const candidates = [...document.querySelectorAll('span, div, p, em, b')].filter(isVisible);
+        for (const el of candidates) {
+            const text = el.textContent.trim();
+            const match = text.match(/^(\d+)\s*\/\s*(\d+)$/);
+            if (match) {
+                const current = parseInt(match[1], 10);
+                const total = parseInt(match[2], 10);
+                if (total > 0 && current > 0 && current <= total) {
+                    return { current: current, total: total, el: el };
+                }
+            }
+        }
+        return null;
+    }
+
+    function clickDocumentNextPage() {
+        const textBtns = ['下一页', '下一张', '下一章'];
+        for (const text of textBtns) {
+            const btn = findByExactText(text).find((el) => !el.closest('.ended-mask, .catalogue-list, .catalog-list'));
+            if (btn && clickElement(btn)) {
+                return true;
+            }
+        }
+
+        const iconSelectors = [
+            '.ivu-icon-ios-arrow-forward',
+            '.ivu-icon-arrow-right-b',
+            '[class*="arrow-forward"]',
+            '[class*="arrow-right"]',
+            '[class*="icon-next"]',
+            '[class*="page-next"]',
+            '[class*="PageNext"]'
+        ];
+        for (const sel of iconSelectors) {
+            const icons = [...document.querySelectorAll(sel)].filter(isVisible);
+            for (const icon of icons) {
+                const target = icon.closest('button, a, span, div') || icon;
+                if (clickElement(target)) {
+                    return true;
+                }
+            }
+        }
+
+        const pageInfo = getDocumentPageInfo();
+        if (pageInfo && pageInfo.el.parentElement) {
+            const siblings = [...pageInfo.el.parentElement.children].filter(isVisible);
+            const idx = siblings.indexOf(pageInfo.el);
+            if (idx >= 0) {
+                for (let i = idx + 1; i < siblings.length; i++) {
+                    const target = siblings[i].querySelector('i, button, span, a') || siblings[i];
+                    if (clickElement(target)) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        document.documentElement.dispatchEvent(new KeyboardEvent('keydown', {
+            key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, bubbles: true
+        }));
+        return true;
+    }
+
+    function finishCurrentCourse() {
+        if (location.pathname.includes('/train2/')) {
+            log('本节已学完，返回课程列表');
+            forceReleaseIfPlayerPage();
+            const memberUrl = location.href.replace(/\/training\/[^/?#]+.*$/, '/training/member');
+            if (memberUrl !== location.href) {
+                setTimeout(() => { location.href = memberUrl; }, 2000);
+            }
+            return;
+        }
+        log('本节已学完，关闭页面返回列表');
+        forceReleaseIfPlayerPage();
+        setTimeout(() => {
+            if (window.opener) {
+                window.close();
+            } else {
+                history.back();
+            }
+        }, 2000);
+    }
+
+    function handleDocumentPlayer() {
+        const pageInfo = getDocumentPageInfo();
+        const pageInterval = Math.max(3000, (DOC_PAGE_SECONDS * 1000) / PLAYBACK_RATE);
+        const catalogInterval = Math.max(15000, (DOC_CATALOG_SECONDS * 1000) / PLAYBACK_RATE);
+        const now = Date.now();
+
+        if (pageInfo) {
+            const pageKey = pageInfo.current + '/' + pageInfo.total;
+            if (pageInfo.current < pageInfo.total) {
+                if (lastDocPageKey !== pageKey) {
+                    lastDocPageKey = pageKey;
+                    lastDocPageAt = now;
+                    log(`PPT 阅读中 ${pageInfo.current}/${pageInfo.total}`);
+                    return;
+                }
+                if (now - lastDocPageAt >= pageInterval) {
+                    clickDocumentNextPage();
+                    lastDocPageAt = now;
+                    log(`PPT 翻页 ${pageInfo.current}/${pageInfo.total}`);
+                }
+                return;
+            }
+
+            log(`PPT 已到最后一页 ${pageInfo.current}/${pageInfo.total}`);
+            if (now - lastNextClickAt >= 5000) {
+                if (!tryGoNextVideo()) {
+                    finishCurrentCourse();
+                }
+            }
+            return;
+        }
+
+        if (now - lastCatalogAdvanceAt >= catalogInterval) {
+            if (clickNextCatalogItem()) {
+                lastCatalogAdvanceAt = now;
+                lastDocPageKey = '';
+                return;
+            }
+            if (now - lastNextClickAt >= 5000 && tryGoNextVideo()) {
+                lastCatalogAdvanceAt = now;
+                return;
+            }
+        }
+
+        log('课件学习中…');
     }
 
     function applyPlaybackRate(video) {
@@ -208,6 +373,46 @@
         if (video.paused && !video.ended) {
             video.play().catch(() => {});
         }
+    }
+
+    function handleCommonPopups() {
+        const alarmSelectors = [
+            '.alarmClock-wrapper',
+            '.clock-tip',
+            '[class*="alarmClock"]',
+            '[class*="AlarmClock"]'
+        ];
+        for (const sel of alarmSelectors) {
+            const el = document.querySelector(sel);
+            if (el && isVisible(el)) {
+                clickElement(el);
+                log('已点击继续计时');
+                return true;
+            }
+        }
+        findByContainsText('点击我继续').forEach((el) => {
+            if (!el.closest('.question-stem')) {
+                clickElement(el);
+            }
+        });
+
+        const scoring = document.querySelector('.scoring-wrapper');
+        if (scoring && isVisible(scoring)) {
+            const rateBtn = document.querySelector('div.commit > button.ivu-btn');
+            if (rateBtn) {
+                rateBtn.disabled = false;
+                clickElement(rateBtn);
+                log('已提交课程评分');
+            }
+        }
+
+        handleQuiz();
+
+        const textBtns = document.querySelectorAll('button.ivu-btn.ivu-btn-text');
+        if (textBtns.length === 2 && isVisible(textBtns[1])) {
+            clickElement(textBtns[1]);
+        }
+        return false;
     }
 
     function clickNextCatalogItem() {
@@ -365,7 +570,7 @@
         }
 
         if (isPlayerTabOpen()) {
-            log('已有视频页在学习，等待完成');
+            log('已有学习页在进行，等待完成');
             return;
         }
 
@@ -398,6 +603,16 @@
 
     function handleVideoPlayer() {
         touchPlayerHeartbeat();
+
+        if (handleCommonPopups()) {
+            return;
+        }
+
+        if (!hasActiveVideo()) {
+            handleDocumentPlayer();
+            return;
+        }
+
         let anyEnded = false;
 
         document.querySelectorAll('video').forEach((video) => {
@@ -424,65 +639,11 @@
             }
         });
 
-        const alarmSelectors = [
-            '.alarmClock-wrapper',
-            '.clock-tip',
-            '[class*="alarmClock"]',
-            '[class*="AlarmClock"]'
-        ];
-        for (const sel of alarmSelectors) {
-            const el = document.querySelector(sel);
-            if (el && isVisible(el)) {
-                clickElement(el);
-                log('已点击继续计时');
-                return;
-            }
-        }
-        findByContainsText('点击我继续').forEach((el) => {
-            if (!el.closest('.question-stem')) {
-                clickElement(el);
-            }
-        });
-
-        const scoring = document.querySelector('.scoring-wrapper');
-        if (scoring && isVisible(scoring)) {
-            const rateBtn = document.querySelector('div.commit > button.ivu-btn');
-            if (rateBtn) {
-                rateBtn.disabled = false;
-                clickElement(rateBtn);
-                log('已提交课程评分');
-            }
-        }
-
-        handleQuiz();
-
         const endedMask = document.querySelector('.ended-mask');
         if ((endedMask && isVisible(endedMask)) || anyEnded) {
             if (!tryGoNextVideo()) {
-                if (location.pathname.includes('/train2/')) {
-                    log('本节已学完，返回课程列表');
-                    forceReleaseIfPlayerPage();
-                    const memberUrl = location.href.replace(/\/training\/[^/?#]+.*$/, '/training/member');
-                    if (memberUrl !== location.href) {
-                        setTimeout(() => { location.href = memberUrl; }, 2000);
-                    }
-                } else {
-                    log('本节已学完，关闭页面返回列表');
-                    forceReleaseIfPlayerPage();
-                    setTimeout(() => {
-                        if (window.opener) {
-                            window.close();
-                        } else {
-                            history.back();
-                        }
-                    }, 2000);
-                }
+                finishCurrentCourse();
             }
-        }
-
-        const textBtns = document.querySelectorAll('button.ivu-btn.ivu-btn-text');
-        if (textBtns.length === 2 && isVisible(textBtns[1])) {
-            clickElement(textBtns[1]);
         }
     }
 
@@ -532,7 +693,7 @@
         }
 
         if (isPlayerTabOpen()) {
-            log('已有视频页在学习，等待完成');
+            log('已有学习页在进行，等待完成');
             return;
         }
 
