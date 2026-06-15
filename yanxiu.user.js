@@ -2,7 +2,7 @@
 // @name              教师研修网自动看课脚本
 // @name:zh-CN        教师研修网自动看课脚本
 // @namespace         https://github.com/AGkite/yanxiu
-// @version           2.8.0
+// @version           2.9.0
 // @description       Auto study on yanxiu.com: skip PPT, speed play, quiz, next video lesson.
 // @description:zh-CN yanxiu.com 跳过PPT课件、自动学习视频、倍速播放、自动答题、自动切下一节
 // @author            AGkite
@@ -31,9 +31,11 @@
     const STORAGE_PLAYER_URL = 'yx-player-url';
     // 心跳超过此时间未更新，视为视频页已关闭（后台 tab 约每 15~60 秒刷新一次）
     const HEARTBEAT_ACTIVE = 2 * 60 * 1000;
-    // true = 跳过 PPT/课件，只学习视频
+    // true = 跳过纯 PPT 幻灯片（有页码无视频），「课件」标签的视频仍会学习
     const SKIP_PPT = true;
     const SECTION_HEADERS = ['课程导学', '主题解析', '延伸阅读'];
+    const PLAYER_LOAD_WAIT = 8000;
+    const playerLoadAt = Date.now();
     const TAB_ID = sessionStorage.getItem('yx-tab-id') || ('tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
     sessionStorage.setItem('yx-tab-id', TAB_ID);
     let statusText = '脚本已加载';
@@ -204,12 +206,37 @@
         panel.textContent = `${LOG} ${statusText}`;
     }
 
+    function hasVideoElement() {
+        for (const video of document.querySelectorAll('video')) {
+            if (isVisible(video)) {
+                return true;
+            }
+        }
+        for (const frame of document.querySelectorAll('iframe')) {
+            try {
+                const doc = frame.contentDocument;
+                if (doc && doc.querySelector('video')) {
+                    return true;
+                }
+            } catch (e) {
+                // 跨域 iframe 忽略
+            }
+        }
+        return false;
+    }
+
     function hasActiveVideo() {
         for (const video of document.querySelectorAll('video')) {
             if (!isVisible(video)) {
                 continue;
             }
             if (video.duration && !isNaN(video.duration) && video.duration > 0) {
+                return true;
+            }
+            if (video.currentTime > 0) {
+                return true;
+            }
+            if (video.readyState >= 2) {
                 return true;
             }
         }
@@ -231,17 +258,11 @@
         return false;
     }
 
-    function isCatalogItemCourseware(item) {
-        if (!item) {
+    function isPptSlidePage() {
+        if (hasVideoElement() || hasActiveVideo()) {
             return false;
         }
-        const badges = item.querySelectorAll('span, em, label, i, div');
-        for (const badge of badges) {
-            if (badge.textContent.trim() === '课件' && isVisible(badge)) {
-                return true;
-            }
-        }
-        return item.textContent.includes('课件');
+        return !!getDocumentPageInfo();
     }
 
     function isSectionHeader(item) {
@@ -288,21 +309,6 @@
         return activeIndex;
     }
 
-    function isCoursewarePage() {
-        if (hasActiveVideo()) {
-            return false;
-        }
-        if (getDocumentPageInfo()) {
-            return true;
-        }
-        const items = getCatalogItems();
-        const activeIndex = findActiveCatalogIndex(items);
-        if (activeIndex >= 0 && isCatalogItemCourseware(items[activeIndex])) {
-            return true;
-        }
-        return !hasActiveVideo() && findByExactText('课件').some((el) => isVisible(el));
-    }
-
     function clickCatalogItem(items, index) {
         const item = items[index];
         if (!item || isSectionHeader(item)) {
@@ -316,7 +322,7 @@
         return false;
     }
 
-    function clickNextVideoCatalogItem() {
+    function clickNextCatalogItem() {
         const items = getCatalogItems();
         if (items.length === 0) {
             return false;
@@ -324,7 +330,7 @@
         const activeIndex = findActiveCatalogIndex(items);
         const start = activeIndex >= 0 ? activeIndex + 1 : 0;
         for (let i = start; i < items.length; i++) {
-            if (isSectionHeader(items[i]) || isCatalogItemCourseware(items[i])) {
+            if (isSectionHeader(items[i])) {
                 continue;
             }
             if (clickCatalogItem(items, i)) {
@@ -334,34 +340,24 @@
         return false;
     }
 
-    function clickFirstVideoCatalogItem() {
-        const items = getCatalogItems();
-        for (let i = 0; i < items.length; i++) {
-            if (isSectionHeader(items[i]) || isCatalogItemCourseware(items[i])) {
-                continue;
-            }
-            if (clickCatalogItem(items, i)) {
-                return true;
-            }
+    function handleSkipPptSlide() {
+        if (!SKIP_PPT || !isPptSlidePage()) {
+            return;
         }
-        return false;
-    }
-
-    function handleSkipCourseware() {
         const now = Date.now();
         if (now - lastSkipAt < 2000) {
             return;
         }
 
-        if (clickNextVideoCatalogItem()) {
+        if (clickNextCatalogItem()) {
             lastSkipAt = now;
-            log('已跳过课件，切换下一视频');
+            log('已跳过 PPT，切换下一节');
             return;
         }
 
-        log('本课程无视频内容，返回列表');
+        log('目录已全部浏览，返回列表');
         lastSkipAt = now;
-        if (now - lastNextClickAt >= 3000) {
+        if (now - lastNextClickAt >= 5000) {
             lastNextClickAt = now;
             finishCurrentCourse();
         }
@@ -474,7 +470,7 @@
             return true;
         }
 
-        if (clickNextVideoCatalogItem()) {
+        if (clickNextCatalogItem()) {
             lastNextClickAt = now;
             return true;
         }
@@ -599,8 +595,19 @@
         }
 
         if (!hasActiveVideo()) {
+            if (hasVideoElement()) {
+                document.querySelectorAll('video').forEach((video) => {
+                    video.play().catch(() => {});
+                });
+                log('视频加载中…');
+                return;
+            }
+            if (Date.now() - playerLoadAt < PLAYER_LOAD_WAIT) {
+                log('页面加载中…');
+                return;
+            }
             if (SKIP_PPT) {
-                handleSkipCourseware();
+                handleSkipPptSlide();
             }
             return;
         }
@@ -732,13 +739,6 @@
             handleVideoPlayer();
             setInterval(handleVideoPlayer, 3000);
             setInterval(handleQuiz, 5000);
-            if (SKIP_PPT) {
-                setTimeout(() => {
-                    if (isCoursewarePage()) {
-                        clickFirstVideoCatalogItem() || handleSkipCourseware();
-                    }
-                }, 2500);
-            }
         } else {
             cleanupStaleLock();
             setTimeout(() => {
