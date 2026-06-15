@@ -1,0 +1,560 @@
+// ==UserScript==
+// @name              教师研修网自动看课脚本
+// @name:zh-CN        教师研修网自动看课脚本
+// @namespace         https://github.com/AGkite/yanxiu
+// @version           2.4.0
+// @description       Auto study on yanxiu.com: course pick, speed play, quiz, next lesson.
+// @description:zh-CN yanxiu.com 自动选课、倍速播放、自动答题、自动切下一节
+// @author            AGkite
+// @match             https://*.yanxiu.com/*
+// @icon              https://www.google.com/s2/favicons?sz=64&domain=yanxiu.com
+// @grant             none
+// @run-at            document-idle
+// @license           MIT
+// @charset           UTF-8
+// @homepageURL       https://github.com/AGkite/yanxiu
+// @supportURL        https://github.com/AGkite/yanxiu/issues
+// @downloadURL       https://raw.githubusercontent.com/AGkite/yanxiu/main/yanxiu.user.js
+// @updateURL         https://raw.githubusercontent.com/AGkite/yanxiu/main/yanxiu.user.js
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const LOG = '[研修网刷课]';
+    // 倍速设置：建议 1~2，过高可能导致学时不记录或被检测
+    const PLAYBACK_RATE = 2;
+    // 心跳超过此时间未更新，视为视频页已关闭（视频页每 3 秒刷新一次）
+    const PLAYER_HEARTBEAT_STALE = 20 * 1000;
+    const STORAGE_PLAYER_HEARTBEAT = 'yx-player-heartbeat';
+    const STORAGE_PLAYER_TAB = 'yx-player-tab-id';
+    const STORAGE_PLAYER_URL = 'yx-player-url';
+    const TAB_ID = sessionStorage.getItem('yx-tab-id') || ('tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+    sessionStorage.setItem('yx-tab-id', TAB_ID);
+    let statusText = '脚本已加载';
+    let lastListClickAt = 0;
+    let lastNextClickAt = 0;
+    let listClickLocked = false;
+
+    function log(msg) {
+        console.log(`${LOG} ${msg}`);
+        statusText = msg;
+        updatePanel();
+    }
+
+    function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function isVisible(element) {
+        if (!(element instanceof Element) || !document.body.contains(element)) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {
+            return false;
+        }
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function clickElement(el) {
+        if (!el || !isVisible(el)) {
+            return false;
+        }
+        el.click();
+        return true;
+    }
+
+    function getHeartbeatAge() {
+        const beat = localStorage.getItem(STORAGE_PLAYER_HEARTBEAT);
+        if (!beat) {
+            return Infinity;
+        }
+        return Date.now() - parseInt(beat, 10);
+    }
+
+    function isPlayerTabOpen() {
+        return getHeartbeatAge() < PLAYER_HEARTBEAT_STALE;
+    }
+
+    function touchPlayerHeartbeat() {
+        const pageType = getPageType();
+        if (pageType !== 'legacy-player' && pageType !== 'train2-player') {
+            return;
+        }
+        localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(Date.now()));
+        localStorage.setItem(STORAGE_PLAYER_TAB, TAB_ID);
+        localStorage.setItem(STORAGE_PLAYER_URL, location.href.split('#')[0]);
+    }
+
+    function clearPlayerTabOpen() {
+        if (localStorage.getItem(STORAGE_PLAYER_TAB) === TAB_ID) {
+            localStorage.removeItem(STORAGE_PLAYER_HEARTBEAT);
+            localStorage.removeItem(STORAGE_PLAYER_TAB);
+            localStorage.removeItem(STORAGE_PLAYER_URL);
+        }
+    }
+
+    // 关闭重复打开的同课程视频标签页
+    function closeDuplicatePlayerTab() {
+        const pageType = getPageType();
+        if (pageType !== 'legacy-player' && pageType !== 'train2-player') {
+            return;
+        }
+        const ownerTab = localStorage.getItem(STORAGE_PLAYER_TAB);
+        const ownerUrl = localStorage.getItem(STORAGE_PLAYER_URL);
+        const currentUrl = location.href.split('#')[0];
+        if (
+            ownerTab &&
+            ownerTab !== TAB_ID &&
+            ownerUrl === currentUrl &&
+            isPlayerTabOpen()
+        ) {
+            log('检测到重复视频页，关闭本标签');
+            setTimeout(() => {
+                window.close();
+            }, 1500);
+        }
+    }
+
+    function getPageType() {
+        const path = location.pathname;
+        if (path.includes('/train2/') && path.includes('/training/member')) {
+            return 'train2-list';
+        }
+        if (path.includes('/train2/')) {
+            return 'train2-player';
+        }
+        if (path === '/train/guide/course/list') {
+            return 'legacy-list';
+        }
+        if (/\/grain\/course\/\d+\/detail/.test(path)) {
+            return 'legacy-player';
+        }
+        if (path.includes('/cms/project/index')) {
+            return 'project-index';
+        }
+        return 'unknown';
+    }
+
+    function findByExactText(text, root) {
+        root = root || document;
+        return [...root.querySelectorAll('button, a, span, div, p, li')].filter((el) => {
+            return el.textContent.trim() === text && isVisible(el);
+        });
+    }
+
+    function findByContainsText(text, root) {
+        root = root || document;
+        return [...root.querySelectorAll('button, a, span, div, p, li')].filter((el) => {
+            return el.textContent.includes(text) && isVisible(el);
+        });
+    }
+
+    function updatePanel() {
+        let panel = document.getElementById('yx-auto-panel');
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = 'yx-auto-panel';
+            panel.style.cssText = [
+                'position:fixed',
+                'top:10px',
+                'right:10px',
+                'z-index:999999',
+                'background:rgba(0,0,0,0.75)',
+                'color:#0f0',
+                'padding:8px 12px',
+                'border-radius:6px',
+                'font-size:13px',
+                'max-width:320px',
+                'line-height:1.5',
+                'pointer-events:none'
+            ].join(';');
+            document.body.appendChild(panel);
+        }
+        panel.textContent = `${LOG} ${statusText} | 倍速 ${PLAYBACK_RATE}x`;
+    }
+
+    function applyPlaybackRate(video) {
+        video.muted = true;
+        if (video.playbackRate !== PLAYBACK_RATE) {
+            video.playbackRate = PLAYBACK_RATE;
+        }
+        if (video.paused && !video.ended) {
+            video.play().catch(() => {});
+        }
+    }
+
+    function clickNextCatalogItem() {
+        const selectors = [
+            '.catalogue-list li',
+            '.catalog-list li',
+            '.menu-list li',
+            '[class*="catalog"] li',
+            '[class*="Catalog"] li',
+            '.ivu-tree-title'
+        ];
+        let items = [];
+        for (const sel of selectors) {
+            const found = [...document.querySelectorAll(sel)].filter(isVisible);
+            if (found.length > 1) {
+                items = found;
+                break;
+            }
+        }
+        if (items.length === 0) {
+            return false;
+        }
+
+        let activeIndex = -1;
+        items.forEach((item, index) => {
+            const cls = item.className || '';
+            const style = window.getComputedStyle(item);
+            if (
+                cls.includes('active') ||
+                cls.includes('current') ||
+                cls.includes('selected') ||
+                item.querySelector('.active, .current, .selected') ||
+                style.color === 'rgb(24, 144, 255)' ||
+                style.fontWeight === '600' ||
+                style.fontWeight === '700'
+            ) {
+                activeIndex = index;
+            }
+        });
+
+        const start = activeIndex >= 0 ? activeIndex + 1 : 0;
+        for (let i = start; i < items.length; i++) {
+            const target = items[i].querySelector('a, span, div, p') || items[i];
+            if (clickElement(target)) {
+                log(`已切换目录第 ${i + 1} 节`);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function tryGoNextVideo() {
+        const now = Date.now();
+        if (now - lastNextClickAt < 5000) {
+            return false;
+        }
+
+        const nextBtn =
+            document.querySelector('p.next') ||
+            document.querySelector('.ended-mask .next') ||
+            findByExactText('下一个')[0] ||
+            findByExactText('下一节')[0] ||
+            findByContainsText('下一个')[0];
+
+        if (nextBtn && isVisible(nextBtn)) {
+            clickElement(nextBtn);
+            lastNextClickAt = now;
+            log('当前视频已学完，点击下一节');
+            return true;
+        }
+
+        if (clickNextCatalogItem()) {
+            lastNextClickAt = now;
+            return true;
+        }
+
+        return false;
+    }
+
+    function handleQuiz() {
+        document.querySelectorAll('.question-stem').forEach((item, index) => {
+            if (!isVisible(item)) {
+                return;
+            }
+            const label = item.querySelector('.label-text');
+            if (label) {
+                clickElement(label);
+            }
+            setTimeout(() => {
+                const btns = document.querySelectorAll('.question button.ivu-btn.ivu-btn-primary');
+                if (btns[index]) {
+                    clickElement(btns[index]);
+                }
+            }, 1500);
+        });
+
+        document.querySelectorAll('.ivu-modal-wrap:not([style*="display: none"]) .ivu-radio-wrapper').forEach((radio) => {
+            if (isVisible(radio)) {
+                clickElement(radio);
+            }
+        });
+        document.querySelectorAll('.ivu-modal-wrap:not([style*="display: none"]) .ivu-btn-primary').forEach((btn) => {
+            if (isVisible(btn) && btn.textContent.includes('确定')) {
+                clickElement(btn);
+            }
+        });
+    }
+
+    function expandModules() {
+        document.querySelectorAll('.ivu-collapse-header, [class*="collapse"] [class*="header"]').forEach((header) => {
+            const item = header.closest('.ivu-collapse-item, [class*="collapse-item"]');
+            if (item && !item.classList.contains('ivu-collapse-item-active')) {
+                clickElement(header);
+            }
+        });
+    }
+
+    function findNextIncompleteLesson() {
+        const watchTexts = ['继续看课', '开始看课', '看课'];
+        const candidates = [...document.querySelectorAll('button, a')].filter((el) => {
+            const text = el.textContent.trim();
+            return watchTexts.includes(text) && isVisible(el);
+        });
+        const buttons = candidates.filter((el) => {
+            return !candidates.some((other) => other !== el && other.contains(el));
+        });
+
+        for (const btn of buttons) {
+            let container = btn.parentElement;
+            for (let depth = 0; depth < 12 && container; depth++) {
+                const match = container.textContent.match(/已观看\s*(\d+)%/);
+                if (match) {
+                    const percent = parseInt(match[1], 10);
+                    if (percent < 100) {
+                        return { button: btn, percent: percent };
+                    }
+                    break;
+                }
+                container = container.parentElement;
+            }
+        }
+
+        if (buttons.length > 0) {
+            return { button: buttons[0], percent: 0 };
+        }
+        return null;
+    }
+
+    function handleCourseList() {
+        expandModules();
+
+        const hasVideo = document.querySelector('video');
+        if (hasVideo && isVisible(hasVideo)) {
+            return;
+        }
+
+        if (isPlayerTabOpen()) {
+            log('已有视频页在学习，等待完成');
+            return;
+        }
+
+        if (listClickLocked) {
+            return;
+        }
+
+        const lesson = findNextIncompleteLesson();
+        if (!lesson) {
+            log('未找到未完成课程，请确认在「课程学习」页面');
+            return;
+        }
+
+        const now = Date.now();
+        if (now - lastListClickAt < 60000) {
+            return;
+        }
+
+        listClickLocked = true;
+        if (clickElement(lesson.button)) {
+            lastListClickAt = now;
+            localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(now));
+            localStorage.setItem(STORAGE_PLAYER_TAB, 'list-pending');
+            log(`已点击继续看课（进度 ${lesson.percent}%）`);
+        }
+        setTimeout(() => {
+            listClickLocked = false;
+        }, 3000);
+    }
+
+    function handleVideoPlayer() {
+        closeDuplicatePlayerTab();
+        touchPlayerHeartbeat();
+        let anyEnded = false;
+
+        document.querySelectorAll('video').forEach((video) => {
+            applyPlaybackRate(video);
+            if (video.ended) {
+                anyEnded = true;
+            }
+        });
+
+        document.querySelectorAll('iframe').forEach((frame) => {
+            try {
+                const doc = frame.contentDocument;
+                if (!doc) {
+                    return;
+                }
+                doc.querySelectorAll('video').forEach((video) => {
+                    applyPlaybackRate(video);
+                    if (video.ended) {
+                        anyEnded = true;
+                    }
+                });
+            } catch (e) {
+                // 跨域 iframe 忽略
+            }
+        });
+
+        const alarmSelectors = [
+            '.alarmClock-wrapper',
+            '.clock-tip',
+            '[class*="alarmClock"]',
+            '[class*="AlarmClock"]'
+        ];
+        for (const sel of alarmSelectors) {
+            const el = document.querySelector(sel);
+            if (el && isVisible(el)) {
+                clickElement(el);
+                log('已点击继续计时');
+                return;
+            }
+        }
+        findByContainsText('点击我继续').forEach((el) => {
+            if (!el.closest('.question-stem')) {
+                clickElement(el);
+            }
+        });
+
+        const scoring = document.querySelector('.scoring-wrapper');
+        if (scoring && isVisible(scoring)) {
+            const rateBtn = document.querySelector('div.commit > button.ivu-btn');
+            if (rateBtn) {
+                rateBtn.disabled = false;
+                clickElement(rateBtn);
+                log('已提交课程评分');
+            }
+        }
+
+        handleQuiz();
+
+        const endedMask = document.querySelector('.ended-mask');
+        if ((endedMask && isVisible(endedMask)) || anyEnded) {
+            if (!tryGoNextVideo()) {
+                if (location.pathname.includes('/train2/')) {
+                    log('本节已学完，返回课程列表');
+                    clearPlayerTabOpen();
+                    const memberUrl = location.href.replace(/\/training\/[^/?#]+.*$/, '/training/member');
+                    if (memberUrl !== location.href) {
+                        setTimeout(() => { location.href = memberUrl; }, 2000);
+                    }
+                } else {
+                    log('本节已学完，关闭页面返回列表');
+                    clearPlayerTabOpen();
+                    setTimeout(() => {
+                        if (window.opener) {
+                            window.close();
+                        } else {
+                            history.back();
+                        }
+                    }, 2000);
+                }
+            }
+        }
+
+        const textBtns = document.querySelectorAll('button.ivu-btn.ivu-btn-text');
+        if (textBtns.length === 2 && isVisible(textBtns[1])) {
+            clickElement(textBtns[1]);
+        }
+    }
+
+    async function handleLegacyCourseList() {
+        await sleep(500);
+
+        function getGoal() {
+            const ems = document.querySelectorAll('em');
+            if (ems.length >= 2) {
+                const total = parseInt(ems[0].innerText.match(/\d+(?=分钟)/));
+                const done = parseInt(ems[1].innerText.match(/\d+(?=分钟)/)[0]);
+                return total - done;
+            }
+            return 300;
+        }
+
+        function getProgress(item) {
+            const info = item.firstElementChild.lastElementChild;
+            if (info.className === 'item-infos pass') {
+                return 1;
+            }
+            if (info.lastElementChild.childElementCount === 1) {
+                return 0;
+            }
+            return 0.01 * parseInt(info.lastElementChild.lastElementChild.innerText.match(/\d+(?=%)/)[0]);
+        }
+
+        const minutesTotal = getGoal();
+        const filterBtn = document.querySelector('ul.filter-data > li:nth-child(3) > div > div.content > div:nth-child(3) > span');
+        if (filterBtn) {
+            clickElement(filterBtn);
+        }
+        await sleep(500);
+
+        if (document.querySelectorAll('div.item').length === 0) {
+            const allBtn = document.querySelector('ul.filter-data > li:nth-child(3) > div > div.content > div:nth-child(1) > span');
+            if (allBtn) {
+                clickElement(allBtn);
+            }
+        }
+        await sleep(500);
+
+        const courses = document.querySelectorAll('div.item');
+        if (minutesTotal <= 0) {
+            log('已完成所需学时');
+            return;
+        }
+
+        if (isPlayerTabOpen()) {
+            log('已有视频页在学习，等待完成');
+            return;
+        }
+
+        for (let i = 0; i < courses.length; i++) {
+            const progress = getProgress(courses[i]);
+            if (progress >= 1) {
+                continue;
+            }
+            const link = courses[i].firstChild.firstChild;
+            if (link) {
+                clickElement(link);
+                localStorage.setItem(STORAGE_PLAYER_HEARTBEAT, String(Date.now()));
+                localStorage.setItem(STORAGE_PLAYER_TAB, 'list-pending');
+                log(`已打开第 ${i + 1} 个课程`);
+            }
+            break;
+        }
+    }
+
+    function start() {
+        updatePanel();
+        const pageType = getPageType();
+        log(`检测到页面类型: ${pageType}`);
+
+        if (pageType === 'train2-list' || pageType === 'project-index') {
+            setTimeout(handleCourseList, 3000);
+            setInterval(handleCourseList, 10000);
+            setInterval(handleVideoPlayer, 3000);
+            setInterval(handleQuiz, 5000);
+        } else if (pageType === 'legacy-list') {
+            handleLegacyCourseList();
+        } else if (pageType === 'train2-player' || pageType === 'legacy-player') {
+            handleVideoPlayer();
+            setInterval(handleVideoPlayer, 3000);
+            setInterval(handleQuiz, 5000);
+        } else {
+            setTimeout(() => {
+                handleCourseList();
+                handleVideoPlayer();
+            }, 3000);
+            setInterval(handleCourseList, 10000);
+            setInterval(handleVideoPlayer, 3000);
+            setInterval(handleQuiz, 5000);
+        }
+    }
+
+    start();
+})();
